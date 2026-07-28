@@ -1,0 +1,71 @@
+name: monitor-externo
+
+# Sonda de disponibilidad DESDE FUERA del VPS (lección del incidente 28/07:
+# el corte fue en el borde del proveedor y Kuma, que vive dentro del mismo
+# servidor, vio todo verde — 629 latidos, 0 caídas). Corre en runners de
+# GitHub cada ~5 min y avisa por Telegram al mismo grupo que usa Kuma.
+#
+# Este repo es público (minutos de Actions ilimitados para el cron): acá NO
+# va ningún secreto — solo URLs ya públicas. Token y chat van en Secrets.
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      prueba:
+        description: 'Enviar mensaje de prueba a Telegram aunque todo esté UP'
+        type: boolean
+        default: false
+
+concurrency:
+  group: monitor-externo
+  cancel-in-progress: true
+
+jobs:
+  sondear:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Sondear endpoints y alertar
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PRUEBA: ${{ inputs.prueba }}
+        run: |
+          # objetivo|codigos-esperados (el 401 del mapeador ES señal de vida:
+          # significa que nginx+TLS+auth contestaron)
+          objetivos='
+          https://mapeador.93-188-163-79.sslip.io/|401
+          https://estado.93-188-163-79.sslip.io/status/fife|200
+          '
+          caidos=""
+          for linea in $objetivos; do
+            url="${linea%%|*}"; esperado="${linea##*|}"
+            ok=""
+            # 3 intentos con pausa: un blip de red del runner no debe alertar
+            for i in 1 2 3; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$url" || echo 000)
+              if [ "$code" = "$esperado" ]; then ok=1; break; fi
+              sleep 10
+            done
+            if [ -z "$ok" ]; then
+              echo "DOWN: $url (ultimo codigo: $code, esperado: $esperado)"
+              caidos="$caidos\n• $url → $code"
+            else
+              echo "UP: $url ($code)"
+            fi
+          done
+
+          avisar() {
+            curl -s -m 15 "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode text="$1" > /dev/null
+          }
+
+          if [ -n "$caidos" ]; then
+            avisar "$(printf '🔴 MONITOR EXTERNO: la plataforma no responde desde internet%b\n\n(sonda desde GitHub Actions; Kuma interno puede seguir verde si el corte es en el borde del proveedor)' "$caidos")"
+            exit 1
+          fi
+          if [ "$PRUEBA" = "true" ]; then
+            avisar "✅ Monitor externo activo: sonda de prueba OK (mapeador y página de estado responden desde internet)"
+          fi
