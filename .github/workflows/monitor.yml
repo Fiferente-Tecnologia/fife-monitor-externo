@@ -1,12 +1,20 @@
 name: monitor-externo
 
-# Sonda de disponibilidad DESDE FUERA del VPS (lección del incidente 28/07:
-# el corte fue en el borde del proveedor y Kuma, que vive dentro del mismo
-# servidor, vio todo verde — 629 latidos, 0 caídas). Corre en runners de
-# GitHub cada ~5 min y avisa por Telegram al mismo grupo que usa Kuma.
+# Sonda de disponibilidad DESDE FUERA del VPS (lección del incidente 28/07: el
+# corte fue en el borde del proveedor y Kuma, que vive dentro del mismo
+# servidor, vio todo verde — 629 latidos, 0 caídas).
 #
-# Este repo es público (minutos de Actions ilimitados para el cron): acá NO
-# va ningún secreto — solo URLs ya públicas. Token y chat van en Secrets.
+# ⚠️ Por qué VIGILA EN BUCLE y no sondea una vez: el cron declara '*/5' pero
+# GitHub lo ejecuta cada 1–3 h (medido el 30/07 sobre 10 corridas: 16:05,
+# 17:34, 18:35, 19:57, 21:00, 22:08, 00:12, 03:31, 06:09 UTC — los intervalos
+# cortos son los primeros que GitHub degrada). Con un sondeo puntual cada
+# 1–3 h, un corte de ~50 min se detecta por SUERTE: así se cazó el episodio
+# del 29/07, de casualidad. Cada corrida vigila ahora en bucle ~50 min, que es
+# lo que convierte la detección en algo por diseño. El repo es público, así que
+# los minutos de Actions son ilimitados y el job largo no cuesta nada.
+#
+# Este repo es público: acá NO va ningún secreto — solo URLs ya públicas.
+# Token y chat van en Secrets.
 on:
   schedule:
     - cron: '*/5 * * * *'
@@ -19,18 +27,24 @@ on:
 
 concurrency:
   group: monitor-externo
+  # La corrida nueva reemplaza a la que esté vigilando: así siempre hay UNA
+  # activa y las corridas no se acumulan en cola (con 'false' la nueva
+  # esperaría y se perdería la ventana).
   cancel-in-progress: true
 
 jobs:
   sondear:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 55 = los ~50 min de vigilancia + margen para que el job cierre solo.
+    timeout-minutes: 55
     steps:
-      - name: Sondear endpoints y alertar
+      - name: Vigilar endpoints en bucle y alertar
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PRUEBA: ${{ inputs.prueba }}
+          VIGILANCIA_SEG: '3000'   # ~50 min
+          INTERVALO_SEG: '60'
         run: |
           # objetivo|codigos-esperados (el 401 del mapeador ES señal de vida:
           # significa que nginx+TLS+auth contestaron)
@@ -38,23 +52,6 @@ jobs:
           https://mapeador.93-188-163-79.sslip.io/|401
           https://estado.93-188-163-79.sslip.io/status/fife|200
           '
-          caidos=""
-          for linea in $objetivos; do
-            url="${linea%%|*}"; esperado="${linea##*|}"
-            ok=""
-            # 3 intentos con pausa: un blip de red del runner no debe alertar
-            for i in 1 2 3; do
-              code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$url" || echo 000)
-              if [ "$code" = "$esperado" ]; then ok=1; break; fi
-              sleep 10
-            done
-            if [ -z "$ok" ]; then
-              echo "DOWN: $url (ultimo codigo: $code, esperado: $esperado)"
-              caidos="$caidos\n• $url → $code"
-            else
-              echo "UP: $url ($code)"
-            fi
-          done
 
           avisar() {
             curl -s -m 15 "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
@@ -62,10 +59,58 @@ jobs:
               --data-urlencode text="$1" > /dev/null
           }
 
-          if [ -n "$caidos" ]; then
-            avisar "$(printf '🔴 MONITOR EXTERNO: la plataforma no responde desde internet%b\n\n(sonda desde GitHub Actions; Kuma interno puede seguir verde si el corte es en el borde del proveedor)' "$caidos")"
-            exit 1
-          fi
+          # Un ciclo = sondear todos los objetivos. Devuelve 0 si todos OK.
+          # Deja en $caidos el detalle para el mensaje.
+          sondear_todo() {
+            caidos=""
+            for linea in $objetivos; do
+              url="${linea%%|*}"; esperado="${linea##*|}"
+              ok=""
+              # 3 intentos con pausa: un blip de red del runner no debe alertar
+              for i in 1 2 3; do
+                code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$url" || echo 000)
+                if [ "$code" = "$esperado" ]; then ok=1; break; fi
+                sleep 5
+              done
+              [ -z "$ok" ] && caidos="$caidos\n• $url → $code"
+            done
+            [ -z "$caidos" ]
+          }
+
+          fin=$(( $(date +%s) + VIGILANCIA_SEG ))
+          # Estado en memoria del bucle: se avisa al CRUZAR (caído / recuperado),
+          # no en cada ciclo — si no, una caída de una hora manda 50 mensajes.
+          # Al reiniciarse la corrida el estado se pierde y puede repetirse un
+          # aviso: preferible a no avisar.
+          estaba_caido=0
+          ciclos=0
+          hubo_caida=0
+
+          while [ "$(date +%s)" -lt "$fin" ]; do
+            ciclos=$((ciclos + 1))
+            if sondear_todo; then
+              if [ "$estaba_caido" -eq 1 ]; then
+                echo "RECUPERADO (ciclo $ciclos)"
+                avisar "✅ MONITOR EXTERNO: la plataforma volvió a responder desde internet."
+                estaba_caido=0
+              fi
+            else
+              if [ "$estaba_caido" -eq 0 ]; then
+                echo "DOWN (ciclo $ciclos):$caidos"
+                avisar "$(printf '🔴 MONITOR EXTERNO: la plataforma no responde desde internet%b\n\n(sonda desde GitHub Actions; Kuma interno puede seguir verde si el corte es en el borde del proveedor)' "$caidos")"
+                estaba_caido=1
+                hubo_caida=1
+              fi
+            fi
+            sleep "$INTERVALO_SEG"
+          done
+
+          echo "vigilancia terminada: $ciclos ciclos en ${VIGILANCIA_SEG}s"
+
           if [ "$PRUEBA" = "true" ]; then
-            avisar "✅ Monitor externo activo: sonda de prueba OK (mapeador y página de estado responden desde internet)"
+            avisar "✅ Monitor externo activo: vigiló ${ciclos} ciclos durante ~$((VIGILANCIA_SEG / 60)) min (mapeador y página de estado)."
           fi
+
+          # Sale != 0 si hubo alguna caída en la ventana, para que quede
+          # marcada en rojo en el historial de Actions.
+          [ "$hubo_caida" -eq 0 ]
