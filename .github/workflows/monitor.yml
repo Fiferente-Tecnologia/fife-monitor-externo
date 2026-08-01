@@ -36,14 +36,20 @@ jobs:
   sondear:
     runs-on: ubuntu-latest
     # 55 = los ~50 min de vigilancia + margen para que el job cierre solo.
-    timeout-minutes: 55
+    # 340 = ~5,5 h de vigilancia + margen. La ventana larga es lo que cierra
+    # los huecos: el cron real de GitHub dispara cada 1–3 h y cada corrida
+    # nueva REEMPLAZA a la anterior (cancel-in-progress), así que con 5,5 h de
+    # bucle siempre hay una corrida cubriendo aunque el scheduler se atrase.
+    # Lección del 31/07: con 50 min de ventana, el corte de 15:17Z cayó en un
+    # hueco de 1,4 h y lo vimos por sondas propias, no por el monitor.
+    timeout-minutes: 340
     steps:
       - name: Vigilar endpoints en bucle y alertar
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PRUEBA: ${{ inputs.prueba }}
-          VIGILANCIA_SEG: '3000'   # ~50 min
+          VIGILANCIA_SEG: '19800'  # ~5,5 h (ver nota en timeout-minutes)
           INTERVALO_SEG: '60'
         run: |
           # objetivo|codigos-esperados (el 401 del mapeador ES señal de vida:
@@ -114,3 +120,4 @@ jobs:
           # Sale != 0 si hubo alguna caída en la ventana, para que quede
           # marcada en rojo en el historial de Actions.
           [ "$hubo_caida" -eq 0 ]
+
