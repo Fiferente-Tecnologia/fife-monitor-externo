@@ -5,13 +5,18 @@ name: monitor-externo
 # servidor, vio todo verde — 629 latidos, 0 caídas).
 #
 # ⚠️ Por qué VIGILA EN BUCLE y no sondea una vez: el cron declara '*/5' pero
-# GitHub lo ejecuta cada 1–3 h (medido el 30/07 sobre 10 corridas: 16:05,
-# 17:34, 18:35, 19:57, 21:00, 22:08, 00:12, 03:31, 06:09 UTC — los intervalos
-# cortos son los primeros que GitHub degrada). Con un sondeo puntual cada
-# 1–3 h, un corte de ~50 min se detecta por SUERTE: así se cazó el episodio
-# del 29/07, de casualidad. Cada corrida vigila ahora en bucle ~50 min, que es
-# lo que convierte la detección en algo por diseño. El repo es público, así que
-# los minutos de Actions son ilimitados y el job largo no cuesta nada.
+# GitHub lo ejecuta cada 1–3 h (medido el 30/07 sobre 10 corridas). Con un
+# sondeo puntual cada 1–3 h, un corte de ~50 min se detecta por SUERTE. Cada
+# corrida vigila en bucle ~5,5 h, que es lo que convierte la detección en algo
+# por diseño. El repo es público, así que los minutos de Actions son
+# ilimitados y el job largo no cuesta nada.
+#
+# ⚠️ Por qué hay SONDA DE CONTROL (05/08): el monitor mandaba alertas al grupo
+# que no se correspondían con caídas reales — la plataforma seguía respondiendo
+# desde otras redes mientras el runner no la alcanzaba. Un runner de Azure con
+# la red degradada, o un corte de ruta Azure↔Hostinger, es indistinguible de un
+# servidor caído si solo se mira al servidor. Ahora cada ciclo comprueba primero
+# que el runner llegue a internet; si no llega, el ciclo NO cuenta.
 #
 # Este repo es público: acá NO va ningún secreto — solo URLs ya públicas.
 # Token y chat van en Secrets.
@@ -35,13 +40,10 @@ concurrency:
 jobs:
   sondear:
     runs-on: ubuntu-latest
-    # 55 = los ~50 min de vigilancia + margen para que el job cierre solo.
-    # 340 = ~5,5 h de vigilancia + margen. La ventana larga es lo que cierra
-    # los huecos: el cron real de GitHub dispara cada 1–3 h y cada corrida
-    # nueva REEMPLAZA a la anterior (cancel-in-progress), así que con 5,5 h de
-    # bucle siempre hay una corrida cubriendo aunque el scheduler se atrase.
-    # Lección del 31/07: con 50 min de ventana, el corte de 15:17Z cayó en un
-    # hueco de 1,4 h y lo vimos por sondas propias, no por el monitor.
+    # 340 = ~5,5 h de vigilancia + margen. La ventana larga cierra los huecos:
+    # el cron real de GitHub dispara cada 1–3 h y cada corrida nueva REEMPLAZA
+    # a la anterior (cancel-in-progress), así que con 5,5 h de bucle siempre hay
+    # una corrida cubriendo aunque el scheduler se atrase.
     timeout-minutes: 340
     steps:
       - name: Vigilar endpoints en bucle y alertar
@@ -51,18 +53,51 @@ jobs:
           PRUEBA: ${{ inputs.prueba }}
           VIGILANCIA_SEG: '19800'  # ~5,5 h (ver nota en timeout-minutes)
           INTERVALO_SEG: '60'
+          # Ciclos consecutivos en rojo antes de avisar. Con INTERVALO_SEG=60
+          # son ~3 min sostenidos: un blip de 45 s ya no despierta al grupo.
+          CONFIRMACIONES: '3'
         run: |
-          # objetivo|codigos-esperados (el 401 del mapeador ES señal de vida:
+          # objetivo|codigo-esperado (el 401 del mapeador ES señal de vida:
           # significa que nginx+TLS+auth contestaron)
           objetivos='
           https://mapeador.93-188-163-79.sslip.io/|401
           https://estado.93-188-163-79.sslip.io/status/fife|200
           '
 
+          # Referencias ajenas a nuestra infra. Si NINGUNA responde, el que está
+          # mal es el runner: ese ciclo no cuenta y no se avisa nada.
+          controles='
+          https://www.google.com/generate_204|204
+          https://api.github.com/|200
+          '
+
+          # Los dos objetivos cuelgan del mismo dominio: si sslip.io deja de
+          # resolver, ambos caen a la vez y parece una caída de la plataforma.
+          # Hay que poder distinguirlo (y es el argumento para migrar a un
+          # dominio propio).
+          dominio='estado.93-188-163-79.sslip.io'
+
           avisar() {
             curl -s -m 15 "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
               -d chat_id="${TELEGRAM_CHAT_ID}" \
               --data-urlencode text="$1" > /dev/null
+          }
+
+          # Devuelve el código HTTP, o 000 si la conexión ni se estableció.
+          # (Sin el '|| code=000' curl escribía su propio 000 por -w Y el echo
+          # añadía otro: de ahí los '000000' que se veían en los logs.)
+          codigo() {
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$1") || code=000
+            echo "$code"
+          }
+
+          # ¿El runner llega a internet? Basta con que UN control responda.
+          runner_con_red() {
+            for linea in $controles; do
+              url="${linea%%|*}"; esperado="${linea##*|}"
+              [ "$(codigo "$url")" = "$esperado" ] && return 0
+            done
+            return 1
           }
 
           # Un ciclo = sondear todos los objetivos. Devuelve 0 si todos OK.
@@ -74,7 +109,7 @@ jobs:
               ok=""
               # 3 intentos con pausa: un blip de red del runner no debe alertar
               for i in 1 2 3; do
-                code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$url" || echo 000)
+                code=$(codigo "$url")
                 if [ "$code" = "$esperado" ]; then ok=1; break; fi
                 sleep 5
               done
@@ -89,29 +124,62 @@ jobs:
           # Al reiniciarse la corrida el estado se pierde y puede repetirse un
           # aviso: preferible a no avisar.
           estaba_caido=0
+          seguidos=0        # ciclos consecutivos en rojo, todavía sin confirmar
           ciclos=0
+          ignorados=0       # ciclos descartados porque el runner no tenía red
           hubo_caida=0
 
           while [ "$(date +%s)" -lt "$fin" ]; do
             ciclos=$((ciclos + 1))
+
             if sondear_todo; then
+              seguidos=0
               if [ "$estaba_caido" -eq 1 ]; then
                 echo "RECUPERADO (ciclo $ciclos)"
                 avisar "✅ MONITOR EXTERNO: la plataforma volvió a responder desde internet."
                 estaba_caido=0
               fi
-            else
-              if [ "$estaba_caido" -eq 0 ]; then
-                echo "DOWN (ciclo $ciclos):$caidos"
-                avisar "$(printf '🔴 MONITOR EXTERNO: la plataforma no responde desde internet%b\n\n(sonda desde GitHub Actions; Kuma interno puede seguir verde si el corte es en el borde del proveedor)' "$caidos")"
-                estaba_caido=1
-                hubo_caida=1
-              fi
+              sleep "$INTERVALO_SEG"
+              continue
             fi
+
+            # Falló algo. Antes de culpar al servidor: ¿el runner tiene red?
+            if ! runner_con_red; then
+              ignorados=$((ignorados + 1))
+              seguidos=0
+              echo "CICLO IGNORADO (ciclo $ciclos): el runner no llega ni a los controles"
+              sleep "$INTERVALO_SEG"
+              continue
+            fi
+
+            seguidos=$((seguidos + 1))
+            echo "ROJO $seguidos/$CONFIRMACIONES (ciclo $ciclos):$caidos"
+
+            if [ "$seguidos" -lt "$CONFIRMACIONES" ]; then
+              sleep "$INTERVALO_SEG"
+              continue
+            fi
+
+            if [ "$estaba_caido" -eq 0 ]; then
+              # ¿Es el servidor, o el dominio dejó de resolver? Los dos objetivos
+              # cuelgan de sslip.io, así que hay que decirlo distinto.
+              if getent hosts "$dominio" > /dev/null 2>&1; then
+                detalle="$caidos"
+                causa="(sonda desde GitHub Actions, en rojo ${CONFIRMACIONES} ciclos seguidos; Kuma interno puede seguir verde si el corte es en el borde del proveedor)"
+              else
+                detalle="\n• el dominio $dominio NO RESUELVE"
+                causa='(falla la resolución DNS de sslip.io, no necesariamente el servidor)'
+              fi
+              echo "DOWN CONFIRMADO (ciclo $ciclos):$detalle"
+              avisar "$(printf '🔴 MONITOR EXTERNO: la plataforma no responde desde internet%b\n\n%s' "$detalle" "$causa")"
+              estaba_caido=1
+              hubo_caida=1
+            fi
+
             sleep "$INTERVALO_SEG"
           done
 
-          echo "vigilancia terminada: $ciclos ciclos en ${VIGILANCIA_SEG}s"
+          echo "vigilancia terminada: $ciclos ciclos en ${VIGILANCIA_SEG}s ($ignorados ignorados por red del runner)"
 
           if [ "$PRUEBA" = "true" ]; then
             avisar "✅ Monitor externo activo: vigiló ${ciclos} ciclos durante ~$((VIGILANCIA_SEG / 60)) min (mapeador y página de estado)."
@@ -120,4 +188,3 @@ jobs:
           # Sale != 0 si hubo alguna caída en la ventana, para que quede
           # marcada en rojo en el historial de Actions.
           [ "$hubo_caida" -eq 0 ]
-
