@@ -20,8 +20,27 @@ corte solo se detecta sondeando desde un punto externo.
 | `https://mapeador.93-188-163-79.sslip.io/` | HTTP 401 (nginx + TLS + basic auth contestando) |
 | `https://estado.93-188-163-79.sslip.io/status/fife` | HTTP 200 (página de estado de Kuma) |
 
-3 intentos con pausa de 10 s antes de declarar caída (un blip del runner no
-alerta). La alerta va al grupo de Telegram del equipo.
+Cada corrida **vigila en bucle ~5,5 h**, sondeando cada 60 s, y avisa al grupo
+de Telegram solo al *cruzar* de sano a caído (y otra vez al recuperarse), no en
+cada ciclo.
+
+Antes de dar algo por caído hacen falta **tres cosas a la vez**:
+
+1. que los 3 intentos contra el objetivo fallen,
+2. que eso se repita **3 ciclos seguidos** (~3 min sostenidos) — un blip corto
+   no despierta a nadie,
+3. que el runner **sí** llegue a internet, comprobado contra dos referencias
+   ajenas a nuestra infra (`google.com/generate_204` y `api.github.com`). Si el
+   runner no llega ni a los controles, el problema es suyo: el ciclo se ignora.
+
+El punto 3 es la lección del 05/08: el monitor estuvo avisando de caídas que no
+existían — la plataforma respondía desde otras redes mientras el runner de Azure
+no la alcanzaba. Con un solo punto de vista, un runner con la red degradada es
+indistinguible de un servidor caído.
+
+Los dos objetivos cuelgan del mismo dominio, así que si `sslip.io` deja de
+resolver caen juntos y parece una caída de la plataforma. Ese caso se detecta
+aparte y el mensaje lo dice. Es el argumento para migrar a un dominio propio.
 
 ## Este repo es público a propósito
 
@@ -37,7 +56,13 @@ Actions → monitor-externo → Run workflow → marcar `prueba` → debe llegar
 
 ## Limitaciones conocidas
 
-- El cron de GitHub no es puntual: los ~5 min pueden ser 5–20 según carga de
-  GitHub. Para esta clase de fallo (cortes de decenas de minutos) alcanza.
-- Sin estado entre corridas: mientras dure una caída, alerta en cada corrida
-  (cada ~5–20 min). Es deliberado — simple y sin falsos "recuperado".
+- El cron de GitHub no es puntual: declara `*/5` pero dispara cada 1–3 h. Por
+  eso cada corrida vigila 5,5 h en bucle y la nueva reemplaza a la anterior
+  (`cancel-in-progress`): siempre hay una cubriendo, aunque el scheduler se
+  atrase.
+- Sin estado **entre** corridas: el bucle recuerda si ya avisó, pero al
+  reemplazarse la corrida ese estado se pierde. Una caída que dure más que la
+  ventana puede repetir el aviso una vez cada 1–3 h. Preferible a no avisar.
+- Un solo punto de observación (runners de GitHub, red de Azure). Los controles
+  descartan que el runner esté aislado, pero no un corte de ruta que afecte solo
+  a Azure↔Hostinger. Para eso haría falta una segunda sonda en otra red.
