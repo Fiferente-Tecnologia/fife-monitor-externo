@@ -18,6 +18,18 @@ name: monitor-externo
 # servidor caído si solo se mira al servidor. Ahora cada ciclo comprueba primero
 # que el runner llegue a internet; si no llega, el ciclo NO cuenta.
 #
+# ⚠️ Por qué hay SEGUNDA OPINIÓN EXTERNA (08/08): la sonda de control no bastó.
+# Diagnóstico del 08/08 (3 alertas falsas en una tarde): el borde de Hostinger
+# DROPEA la IP de ~la mitad de los runners — nginx ni registra sus conexiones
+# (no es fail2ban: jail sshd, 0 bans) — mientras google/github sí responden al
+# runner y el resto del mundo sí alcanza la plataforma. En el access.log se ve
+# la lotería por corrida: 57.154.5.65 pasa, la siguiente IP no, 13.83.166.226
+# pasa. Con solo la sonda de control eso confirma "servidor caído" y es falso.
+# Ahora, antes de alertar, se le pregunta a check-host.net (nodos neutrales en
+# varios países): si CUALQUIER nodo recibe el 200 de la página de estado, el
+# bloqueado es el runner y la alerta se suprime; si ningún nodo la ve, la caída
+# es real y el aviso sale con esa confirmación.
+#
 # Este repo es público: acá NO va ningún secreto — solo URLs ya públicas.
 # Token y chat van en Secrets.
 on:
@@ -100,6 +112,24 @@ jobs:
             return 1
           }
 
+          # Segunda opinión desde nodos NEUTRALES (check-host.net): ¿alguien
+          # fuera de Azure recibe el 200 de la página de estado? Devuelve 0 si
+          # la plataforma está viva desde fuera (→ el bloqueado es ESTE runner,
+          # borde de Hostinger, diagnóstico 08/08). Si check-host no contesta o
+          # no da veredicto, devuelve 1: sin exculpación no se calla ninguna
+          # alerta — ante la duda, se avisa.
+          vivo_desde_fuera() {
+            rid=$(curl -s -m 20 -H 'Accept: application/json' \
+              "https://check-host.net/check-http?host=https://${dominio}/status/fife&max_nodes=3" \
+              | jq -r '.request_id // empty') || return 1
+            [ -n "$rid" ] || return 1
+            sleep 20
+            curl -s -m 20 -H 'Accept: application/json' \
+              "https://check-host.net/check-result/${rid}" \
+              | jq -e '[.[] | select(. != null) | .[0] | select(. != null) | .[0]] | any(. == 1)' \
+              > /dev/null
+          }
+
           # Un ciclo = sondear todos los objetivos. Devuelve 0 si todos OK.
           # Deja en $caidos el detalle para el mensaje.
           sondear_todo() {
@@ -127,6 +157,7 @@ jobs:
           seguidos=0        # ciclos consecutivos en rojo, todavía sin confirmar
           ciclos=0
           ignorados=0       # ciclos descartados porque el runner no tenía red
+          falsos=0          # confirmaciones suprimidas: check-host vio la plataforma viva
           hubo_caida=0
 
           while [ "$(date +%s)" -lt "$fin" ]; do
@@ -164,8 +195,16 @@ jobs:
               # ¿Es el servidor, o el dominio dejó de resolver? Los dos objetivos
               # cuelgan de sslip.io, así que hay que decirlo distinto.
               if getent hosts "$dominio" > /dev/null 2>&1; then
+                # Última puerta antes de despertar al grupo: la segunda opinión.
+                if vivo_desde_fuera; then
+                  falsos=$((falsos + 1))
+                  seguidos=0
+                  echo "FALSO POSITIVO (ciclo $ciclos): check-host ve la plataforma viva — el borde del proveedor bloquea la IP de este runner. Suprimo:$caidos"
+                  sleep "$INTERVALO_SEG"
+                  continue
+                fi
                 detalle="$caidos"
-                causa="(sonda desde GitHub Actions, en rojo ${CONFIRMACIONES} ciclos seguidos; Kuma interno puede seguir verde si el corte es en el borde del proveedor)"
+                causa="(en rojo ${CONFIRMACIONES} ciclos desde GitHub Actions Y los nodos externos de check-host tampoco la alcanzan — caída real desde internet; Kuma interno puede seguir verde si el corte es en el borde del proveedor)"
               else
                 detalle="\n• el dominio $dominio NO RESUELVE"
                 causa='(falla la resolución DNS de sslip.io, no necesariamente el servidor)'
@@ -179,7 +218,7 @@ jobs:
             sleep "$INTERVALO_SEG"
           done
 
-          echo "vigilancia terminada: $ciclos ciclos en ${VIGILANCIA_SEG}s ($ignorados ignorados por red del runner)"
+          echo "vigilancia terminada: $ciclos ciclos en ${VIGILANCIA_SEG}s ($ignorados ignorados por red del runner, $falsos suprimidos por veredicto externo)"
 
           if [ "$PRUEBA" = "true" ]; then
             avisar "✅ Monitor externo activo: vigiló ${ciclos} ciclos durante ~$((VIGILANCIA_SEG / 60)) min (mapeador y página de estado)."
